@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Han Boetes <hboetes@gmail.com>
+# SPDX-License-Identifier: MIT License
+
+"""
+cursed.py
+
+Curses TUI listing common sysadmin CLI/TUI tools with short descriptions,
+scanning whether each is installed (via `command -v`, so it works on any
+POSIX shell/distro without assuming a package manager), and letting you
+launch any installed tool directly from the list.
+
+Controls:
+  Up/Down or j/k   - move selection
+  Enter            - launch selected tool (if installed)
+  /                - filter/search by name or category
+  Esc              - clear filter
+  r                - rescan installed status
+  q                - quit
+"""
+
+import curses
+import shutil
+import subprocess
+import sys
+
+TOOLS = [
+    # (name, category, description, needs_sudo)
+    # needs_sudo reflects documented default behavior on a stock system;
+    # it can vary with setcap/sudoers/group config, so treat it as a
+    # starting point and adjust for your own setup.
+    ("htop", "monitor", "Interactive process/resource viewer", False),
+    ("btop", "monitor", "Modern resource monitor, htop successor", False),
+    ("glances", "monitor", "Cross-platform system overview (CPU/mem/disk/net)", False),
+    ("atop", "monitor", "Resource monitor with historical logging", False),
+    ("nmon", "monitor", "Performance monitor (CPU/mem/disk/net)", False),
+    ("s-tui", "monitor", "CPU frequency/temperature/power stress monitor", False),
+    ("powertop", "monitor", "Power usage analysis and tuning", True),
+    ("bpytop", "monitor", "Python resource monitor, htop-style", False),
+    ("nmtui", "network", "NetworkManager text UI (connections, wifi)", False),
+    ("wavemon", "network", "Wireless link quality/signal monitor", False),
+    ("iftop", "network", "Bandwidth usage by connection", True),
+    ("nethogs", "network", "Bandwidth usage by process", True),
+    ("bmon", "network", "Bandwidth monitor and rate estimator", False),
+    ("mtr", "network", "Live combined traceroute + ping", False),
+    ("ncdu", "disk", "Disk usage analyzer, browsable tree", False),
+    ("iotop", "disk", "Disk I/O usage by process", True),
+    ("mc", "files", "Midnight Commander, classic file manager", False),
+    ("ranger", "files", "Vim-inspired terminal file manager", False),
+    ("nnn", "files", "Fast, lightweight terminal file manager", False),
+    ("lf", "files", "Terminal file manager written in Go", False),
+    ("tig", "git", "Git repository browser / log viewer", False),
+    ("lazygit", "git", "Git TUI for staging, committing, branching", False),
+    ("lazydocker", "containers", "Docker/docker-compose TUI", False),
+    ("k9s", "containers", "Kubernetes cluster TUI", False),
+    ("mutt", "mail", "Text-based email client", False),
+    ("neomutt", "mail", "Mutt fork with extra features", False),
+    ("irssi", "chat", "IRC client", False),
+    ("weechat", "chat", "Extensible chat client (IRC, etc.)", False),
+    ("vim", "editor", "Modal text editor", False),
+    ("nvim", "editor", "Neovim, modern vim fork", False),
+    ("emacs", "editor", "Extensible text editor / environment", False),
+    ("tmux", "multiplexer", "Terminal multiplexer, detachable sessions", False),
+    ("screen", "multiplexer", "Terminal multiplexer (older, still common)", False),
+]
+
+
+def is_installed(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def scan_all():
+    return {name: is_installed(name) for name, _, _, _ in TOOLS}
+
+
+class App:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.status = scan_all()
+        self.filter_text = ""
+        self.filtering = False
+        self.selected = 0
+        self.items = list(TOOLS)
+        self.message = ""
+
+    def apply_filter(self):
+        if not self.filter_text:
+            self.items = list(TOOLS)
+        else:
+            f = self.filter_text.lower()
+            self.items = [
+                t for t in TOOLS
+                if f in t[0].lower() or f in t[1].lower() or f in t[2].lower()
+            ]
+        self.selected = min(self.selected, max(0, len(self.items) - 1))
+
+    def draw(self):
+        stdscr = self.stdscr
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        title = " Sysadmin CLI/TUI Tools "
+        stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+
+        header = f"{'':2}{'NAME':<14}{'CAT':<13}{'STATUS':<12}{'ROOT':<6}DESCRIPTION"
+        stdscr.addstr(1, 0, header[:w - 1], curses.A_UNDERLINE)
+
+        list_top = 2
+        list_height = h - list_top - 3  # reserve footer lines
+
+        # scroll offset so selected stays visible
+        offset = 0
+        if self.selected >= list_height:
+            offset = self.selected - list_height + 1
+
+        for i, (name, cat, desc, needs_sudo) in enumerate(self.items[offset:offset + list_height]):
+            row = list_top + i
+            idx = offset + i
+            installed = self.status.get(name, False)
+            marker = ">" if idx == self.selected else " "
+            status_text = "installed" if installed else "missing"
+            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+            color = curses.color_pair(1) if installed else curses.color_pair(2)
+
+            line = f"{marker} {name:<14}{cat:<13}"
+            stdscr.addstr(row, 0, line[:w - 1], attr)
+            status_col = len(line)
+            if status_col < w - 1:
+                stdscr.addstr(row, status_col, f"{status_text:<12}"[:max(0, w - 1 - status_col)],
+                              attr | color)
+            root_col = status_col + 12
+            root_text = "sudo" if needs_sudo else ""
+            if root_col < w - 1:
+                stdscr.addstr(row, root_col, f"{root_text:<6}"[:max(0, w - 1 - root_col)],
+                              attr | (curses.color_pair(3) if needs_sudo else curses.A_NORMAL))
+            desc_col = root_col + 6
+            if desc_col < w - 1:
+                stdscr.addstr(row, desc_col, desc[:max(0, w - 1 - desc_col)], attr)
+
+        # footer
+        installed_count = sum(1 for v in self.status.values() if v)
+        total = len(TOOLS)
+        footer1 = f"Installed: {installed_count}/{total}   Shown: {len(self.items)}"
+        stdscr.addstr(h - 3, 0, footer1[:w - 1])
+
+        if self.filtering:
+            prompt = f"/{self.filter_text}"
+            stdscr.addstr(h - 2, 0, prompt[:w - 1])
+        elif self.message:
+            stdscr.addstr(h - 2, 0, self.message[:w - 1], curses.A_BOLD)
+        else:
+            help_text = "j/k: move   Enter: launch   /: filter   Esc: clear   r: rescan   q: quit"
+            stdscr.addstr(h - 2, 0, help_text[:w - 1], curses.A_DIM)
+
+        stdscr.refresh()
+
+    def launch_selected(self):
+        if not self.items:
+            return
+        name, _, _, needs_sudo = self.items[self.selected]
+        if not self.status.get(name, False):
+            self.message = f"'{name}' is not installed — nothing to launch."
+            return
+        self.message = ""
+        cmd = ["sudo", name] if needs_sudo else [name]
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            # endwin() returns the terminal to normal (cooked) mode first,
+            # so a sudo password prompt below is read/echoed normally.
+            subprocess.call(cmd)
+        except Exception as exc:
+            # We're outside curses here; print, then re-enter and show it too
+            print(f"Failed to launch {name}: {exc}", file=sys.stderr)
+            self.message = f"Failed to launch '{name}': {exc}"
+        self.stdscr.refresh()
+        curses.curs_set(0)
+
+    def run(self):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+
+        self.apply_filter()
+
+        while True:
+            self.draw()
+            ch = self.stdscr.getch()
+
+            if self.filtering:
+                if ch in (10, 13):  # Enter
+                    self.filtering = False
+                elif ch == 27:  # Esc
+                    self.filtering = False
+                    self.filter_text = ""
+                    self.apply_filter()
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    self.filter_text = self.filter_text[:-1]
+                    self.apply_filter()
+                elif 32 <= ch <= 126:
+                    self.filter_text += chr(ch)
+                    self.apply_filter()
+                continue
+
+            if ch in (ord('q'), ord('Q')):
+                break
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                self.message = ""
+                if self.items:
+                    self.selected = min(self.selected + 1, len(self.items) - 1)
+            elif ch in (curses.KEY_UP, ord('k')):
+                self.message = ""
+                if self.items:
+                    self.selected = max(self.selected - 1, 0)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                self.launch_selected()
+            elif ch == ord('/'):
+                self.message = ""
+                self.filtering = True
+            elif ch == 27:  # Esc clears filter even outside filter mode
+                self.message = ""
+                self.filter_text = ""
+                self.apply_filter()
+            elif ch == ord('r'):
+                self.status = scan_all()
+                self.message = "Rescanned."
+
+
+def main(stdscr):
+    App(stdscr).run()
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        sys.exit(0)
